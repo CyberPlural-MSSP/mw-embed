@@ -1,0 +1,2 @@
+pefile
+iced-x86
