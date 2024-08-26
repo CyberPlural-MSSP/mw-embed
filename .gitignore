@@ -1,2 +1,7 @@
 *.exe
+*.dll
+*.o
+*.7z
 __pycache__
+.venv
+.DS_Store

